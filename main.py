@@ -1,30 +1,31 @@
 from flask import Flask, request, abort
-import requests, os
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageMessage, ImageSendMessage, FollowEvent, UnfollowEvent
-from PIL import Image
-from io import BytesIO
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, FollowEvent, UnfollowEvent
+import os
 import psycopg2
-
-
-# サンプルコードの11~14行目を以下のように書き換え
-LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
-DATABASE_URL = os.environ["DATABASE_URL"]
-HEROKU_APP_NAME = os.environ["HEROKU_APP_NAME"]
+from add_calendar import get_settle_info, save_file, transform_style, read_schedule, main, output_path
 
 app = Flask(__name__)
-Heroku = "https://{}.herokuapp.com/".format(HEROKU_APP_NAME)
 
+# Configurations
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+HEROKU_APP_NAME = os.environ.get("HEROKU_APP_NAME", "")
+CODE = "0"
+
+# LINE Bot API Setup
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-header = {
-    "Content_Type": "application/json",
-    "Authorization": "Bearer " + LINE_CHANNEL_ACCESS_TOKEN
-}
 
+# Database Connection Function
+def get_connection():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+
+# Routes
 @app.route("/")
 def hello_world():
     return "hello world!"
@@ -46,64 +47,7 @@ def callback():
     return "OK"
 
 
-# botにメッセージを送ったときの処理
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=event.message.text))
-    print("返信完了!!\ntext:", event.message.text)
-
-
-# botに画像を送ったときの処理
-@handler.add(MessageEvent, message=ImageMessage)
-def handle_image(event):
-    print("画像を受信")
-    message_id = event.message.id
-    image_path = getImageLine(message_id)
-    line_bot_api.reply_message(
-        event.reply_token,
-        ImageSendMessage(
-            original_content_url = Heroku + image_path["main"],
-            preview_image_url = Heroku + image_path["preview"]
-        )
-    )
-    print("画像の送信完了!!")
-
-
-# 受信メッセージに添付された画像ファイルを取得
-def getImageLine(id):
-    line_url = f"https://api-data.line.me/v2/bot/message/{id}/content"
-    result = requests.get(line_url, headers=header)
-    print(result)
-
-    img = Image.open(BytesIO(result.content))
-    w, h = img.size
-    if w >= h:
-        ratio_main, ratio_preview = w / 1024, w / 240
-    else:
-        ratio_main, ratio_preview = h / 1024, h / 240
-
-    width_main, width_preview = int(w // ratio_main), int(w // ratio_preview)
-    height_main, height_preview = int(h // ratio_main), int(h // ratio_preview)
-
-    img_main = img.resize((width_main, height_main))
-    img_preview = img.resize((width_preview, height_preview))
-    image_path = {
-        "main": f"static/images/image_{id}_main.jpg",
-        "preview": f"static/images/image_{id}_preview.jpg"
-    }
-    img_main.save(image_path["main"])
-    img_preview.save(image_path["preview"])
-    return image_path
-
-
-# データベース接続
-def get_connection():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
-
-
-# botがフォローされたときの処理
+# LINE Bot Events
 @handler.add(FollowEvent)
 def handle_follow(event):
     profile = line_bot_api.get_profile(event.source.user_id)
@@ -120,7 +64,6 @@ def handle_follow(event):
         print(db_check)
 
 
-# botがアンフォロー(ブロック)されたときの処理
 @handler.add(UnfollowEvent)
 def handle_unfollow(event):
     with get_connection() as conn:
@@ -130,25 +73,50 @@ def handle_unfollow(event):
     print("userIdの削除OK!!")
 
 
-# データベースに登録されたLINEアカウントからランダムでひとりにプッシュ通知
-def push():
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute('SELECT * FROM users ORDER BY random() LIMIT 1')
-            (to_user,) = cur.fetchone()
-    line_bot_api.multicast([to_user], TextSendMessage(text="今日もお疲れさん!!"))
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    global CODE
+    received_text = event.message.text
+    if received_text.isdigit() and len(received_text) == 4:
+        CODE = received_text
+        output = get_settle_info(CODE) 
+        result = transform_style(output)
+        save_file(result, output_path)
+        total_list = read_schedule()
+        reply_text = (
+            f"登録情報\n"
+            f"企業情報: {total_list[1]}\n"
+            f"決算日: {total_list[0]}\n"
+            f"{total_list[2]}\n"  
+            f"{total_list[3]}\n"  
+            f"本当に追加しますか？"
+        ) 
+    elif received_text.isdigit() and len(received_text) != 4:
+        reply_text = "証券コードが正しくありません。4桁の数字を入力してください。"
+    elif received_text == "決算日をカレンダーに追加したい":
+        received_text = event.message.text
+        reply_text = "該当の証券コードを入力してください"
+    elif received_text == "はい":
+        main()
+        reply_text = "カレンダーに追加しました"
+    else:
+        reply_text = "入力が不明です"
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply_text)
+    )
+
+    print("返信完了\ntext:", received_text)
 
 
-# アプリの起動
+# Main
 if __name__ == "__main__":
-    # 初回のみデータベースのテーブル作成
     with get_connection() as conn:
         with conn.cursor() as cur:
             conn.autocommit = True
             cur.execute('CREATE TABLE IF NOT EXISTS users(user_id TEXT)')
-    
-    # LINE botをフォローしているアカウントのうちランダムで一人にプッシュ通知
-    push()
+
     port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-### End
+    app.run(host="0.0.0.0", port=port, debug=True)
+    handle_message()
